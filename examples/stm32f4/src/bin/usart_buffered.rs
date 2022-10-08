@@ -16,10 +16,10 @@ async fn main(_spawner: Spawner) {
     info!("Hello World!");
 
     let config = Config::default();
-    let usart = Uart::new(p.USART3, p.PD9, p.PD8, NoDma, NoDma, config);
+    let usart = Uart::new(p.USART2, p.PA3, p.PA2, NoDma, NoDma, config);
 
     let mut state = State::new();
-    let irq = interrupt::take!(USART3);
+    let irq = interrupt::take!(USART2);
     let mut tx_buf = [0u8; 32];
     let mut rx_buf = [0u8; 32];
     let mut buf_usart = BufferedUart::new(&mut state, usart, irq, &mut tx_buf, &mut rx_buf);
