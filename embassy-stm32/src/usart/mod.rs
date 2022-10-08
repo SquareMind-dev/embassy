@@ -1,7 +1,12 @@
 #![macro_use]
 
+use core::future::poll_fn;
 use core::marker::PhantomData;
+use core::sync::atomic::{compiler_fence, Ordering};
+use core::task::Poll;
 
+use embassy_cortex_m::interrupt::InterruptExt;
+use embassy_hal_common::drop::OnDrop;
 use embassy_hal_common::{into_ref, PeripheralRef};
 
 use crate::dma::NoDma;
@@ -78,13 +83,28 @@ pub struct Uart<'d, T: BasicInstance, TxDma = NoDma, RxDma = NoDma> {
     rx: UartRx<'d, T, RxDma>,
 }
 
+pub struct Uart2<'d, T: BasicInstance, TxDma = NoDma, RxDma = NoDma> {
+    tx: Uart2Tx<'d, T, TxDma>,
+    rx: Uart2Rx<'d, T, RxDma>,
+}
+
 pub struct UartTx<'d, T: BasicInstance, TxDma = NoDma> {
     phantom: PhantomData<&'d mut T>,
     tx_dma: PeripheralRef<'d, TxDma>,
 }
 
+pub struct Uart2Tx<'d, T: BasicInstance, TxDma = NoDma> {
+    _peri: PeripheralRef<'d, T>,
+    tx_dma: PeripheralRef<'d, TxDma>,
+}
+
 pub struct UartRx<'d, T: BasicInstance, RxDma = NoDma> {
     phantom: PhantomData<&'d mut T>,
+    rx_dma: PeripheralRef<'d, RxDma>,
+}
+
+pub struct Uart2Rx<'d, T: BasicInstance, RxDma = NoDma> {
+    _peri: PeripheralRef<'d, T>,
     rx_dma: PeripheralRef<'d, RxDma>,
 }
 
@@ -300,6 +320,93 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart<'d, T, TxDma, RxDma> {
     /// transmitting and receiving.
     pub fn split(self) -> (UartTx<'d, T, TxDma>, UartRx<'d, T, RxDma>) {
         (self.tx, self.rx)
+    }
+}
+
+impl<'d, T: BasicInstance, TxDma, RxDma> Uart2<'d, T, TxDma, RxDma> {
+    pub fn new(
+        peri: impl Peripheral<P = T> + 'd,
+        irq: impl Peripheral<P = T::Interrupt> + 'd,
+        rx: impl Peripheral<P = impl RxPin<T>> + 'd,
+        tx: impl Peripheral<P = impl TxPin<T>> + 'd,
+        tx_dma: impl Peripheral<P = TxDma> + 'd,
+        rx_dma: impl Peripheral<P = RxDma> + 'd,
+        config: Config,
+    ) -> Self {
+        into_ref!(peri, irq, rx, tx, tx_dma, rx_dma);
+
+        T::enable();
+        T::reset();
+        let pclk_freq = T::frequency();
+
+        // TODO: better calculation, including error checking and OVER8 if possible.
+        let div = (pclk_freq.0 + (config.baudrate / 2)) / config.baudrate * T::MULTIPLIER;
+
+        let r = T::regs();
+
+        unsafe {
+            rx.set_as_af(rx.af_num(), AFType::Input);
+            tx.set_as_af(tx.af_num(), AFType::OutputPushPull);
+
+            r.cr2().write(|_w| {});
+            r.cr3().write(|_w| {});
+            r.brr().write_value(regs::Brr(div));
+            r.cr1().write(|w| {
+                w.set_ue(true);
+                w.set_te(true);
+                w.set_re(true);
+                w.set_m0(if config.parity != Parity::ParityNone {
+                    vals::M0::BIT9
+                } else {
+                    vals::M0::BIT8
+                });
+                w.set_pce(config.parity != Parity::ParityNone);
+                w.set_ps(match config.parity {
+                    Parity::ParityOdd => vals::Ps::ODD,
+                    Parity::ParityEven => vals::Ps::EVEN,
+                    _ => vals::Ps::EVEN,
+                });
+            });
+        }
+
+        irq.set_handler(Self::on_interrupt);
+        irq.unpend();
+        irq.enable();
+
+        let s = T::state();
+        s.tx_rx_refcount.store(2, Ordering::Relaxed);
+
+        Self {
+            rx: Uart2Rx {
+                _peri: unsafe { peri.clone_unchecked() },
+                rx_dma,
+            },
+            tx: Uart2Tx { _peri: peri, tx_dma },
+        }
+    }
+
+    fn on_interrupt(_: *mut ()) {
+        let r = T::regs();
+        let s = T::state();
+
+        // TODO(gmichel): implement interrupt handler correctly
+        unsafe {
+            let sr = sr(r).read();
+
+            if sr.rxne() || sr.idle() {
+                s.endrx_waker.wake();
+            }
+
+            if sr.tc() {
+                s.endtx_waker.wake();
+            }
+
+            clear_interrupt_flags(r, sr);
+        }
+    }
+
+    pub fn split(self) -> (Uart2Rx<'d, T, RxDma>, Uart2Tx<'d, T, TxDma>) {
+        (self.rx, self.tx)
     }
 }
 
@@ -536,13 +643,34 @@ unsafe fn clear_interrupt_flags(r: Regs, sr: regs::Isr) {
 }
 
 pub(crate) mod sealed {
+    use core::sync::atomic::AtomicU8;
+
+    use embassy_sync::waitqueue::AtomicWaker;
+
     use super::*;
+
+    pub struct State {
+        pub endrx_waker: AtomicWaker,
+        pub endtx_waker: AtomicWaker,
+        pub tx_rx_refcount: AtomicU8,
+    }
+
+    impl State {
+        pub const fn new() -> Self {
+            Self {
+                endrx_waker: AtomicWaker::new(),
+                endtx_waker: AtomicWaker::new(),
+                tx_rx_refcount: AtomicU8::new(0),
+            }
+        }
+    }
 
     pub trait BasicInstance: crate::rcc::RccPeripheral {
         const MULTIPLIER: u32;
         type Interrupt: crate::interrupt::Interrupt;
 
         fn regs() -> Regs;
+        fn state() -> &'static State;
     }
 
     pub trait FullInstance: BasicInstance {
@@ -550,7 +678,7 @@ pub(crate) mod sealed {
     }
 }
 
-pub trait BasicInstance: sealed::BasicInstance {}
+pub trait BasicInstance: Peripheral<P = Self> + sealed::BasicInstance + 'static + Send {}
 
 pub trait FullInstance: sealed::FullInstance {}
 
@@ -571,6 +699,11 @@ macro_rules! impl_lpuart {
 
             fn regs() -> Regs {
                 Regs(crate::pac::$inst.0)
+            }
+
+            fn state() -> &'static crate::usart::sealed::State {
+                static STATE: crate::usart::sealed::State = crate::usart::sealed::State::new();
+                &STATE
             }
         }
 
