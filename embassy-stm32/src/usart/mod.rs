@@ -2,11 +2,10 @@
 
 use core::future::poll_fn;
 use core::marker::PhantomData;
-use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::Poll;
 
+use atomic_polyfill::{compiler_fence, Ordering};
 use embassy_cortex_m::interrupt::InterruptExt;
-use embassy_hal_common::drop::OnDrop;
 use embassy_hal_common::{into_ref, PeripheralRef};
 
 use crate::dma::NoDma;
@@ -83,28 +82,13 @@ pub struct Uart<'d, T: BasicInstance, TxDma = NoDma, RxDma = NoDma> {
     rx: UartRx<'d, T, RxDma>,
 }
 
-pub struct Uart2<'d, T: BasicInstance, TxDma = NoDma, RxDma = NoDma> {
-    tx: Uart2Tx<'d, T, TxDma>,
-    rx: Uart2Rx<'d, T, RxDma>,
-}
-
 pub struct UartTx<'d, T: BasicInstance, TxDma = NoDma> {
     phantom: PhantomData<&'d mut T>,
     tx_dma: PeripheralRef<'d, TxDma>,
 }
 
-pub struct Uart2Tx<'d, T: BasicInstance, TxDma = NoDma> {
-    _peri: PeripheralRef<'d, T>,
-    tx_dma: PeripheralRef<'d, TxDma>,
-}
-
 pub struct UartRx<'d, T: BasicInstance, RxDma = NoDma> {
     phantom: PhantomData<&'d mut T>,
-    rx_dma: PeripheralRef<'d, RxDma>,
-}
-
-pub struct Uart2Rx<'d, T: BasicInstance, RxDma = NoDma> {
-    _peri: PeripheralRef<'d, T>,
     rx_dma: PeripheralRef<'d, RxDma>,
 }
 
@@ -323,7 +307,17 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart<'d, T, TxDma, RxDma> {
     }
 }
 
-impl<'d, T: BasicInstance, TxDma, RxDma> Uart2<'d, T, TxDma, RxDma> {
+pub struct UartWithIdle<'d, T: BasicInstance, TxDma = NoDma, RxDma = NoDma> {
+    tx: UartTx<'d, T, TxDma>,
+    rx: UartRxWithIdle<'d, T, RxDma>,
+}
+
+pub struct UartRxWithIdle<'d, T: BasicInstance, RxDma = NoDma> {
+    _peri: PeripheralRef<'d, T>,
+    rx: UartRx<'d, T, RxDma>,
+}
+
+impl<'d, T: BasicInstance, TxDma, RxDma> UartWithIdle<'d, T, TxDma, RxDma> {
     pub fn new(
         peri: impl Peripheral<P = T> + 'd,
         irq: impl Peripheral<P = T::Interrupt> + 'd,
@@ -374,14 +368,15 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart2<'d, T, TxDma, RxDma> {
         irq.enable();
 
         let s = T::state();
-        s.tx_rx_refcount.store(2, Ordering::Relaxed);
+        // TODO(gmichel): implement drop
+        s.tx_rx_refcount.store(1, Ordering::Relaxed);
 
         Self {
-            rx: Uart2Rx {
-                _peri: unsafe { peri.clone_unchecked() },
-                rx_dma,
+            tx: UartTx::new(tx_dma),
+            rx: UartRxWithIdle {
+                _peri: peri,
+                rx: UartRx::new(rx_dma),
             },
-            tx: Uart2Tx { _peri: peri, tx_dma },
         }
     }
 
@@ -393,20 +388,224 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart2<'d, T, TxDma, RxDma> {
         unsafe {
             let sr = sr(r).read();
 
-            if sr.rxne() || sr.idle() {
-                s.endrx_waker.wake();
-            }
-
-            if sr.tc() {
-                s.endtx_waker.wake();
-            }
+            // This read also clears the error and idle interrupt flags on v1.
+            let _ = rdr(r).read_volatile();
 
             clear_interrupt_flags(r, sr);
+
+            trace!("** on_interrupt called. sr: {:b}", sr.0);
+
+            s.sr.store(sr.0, Ordering::SeqCst);
+
+            if sr.idle() {
+                trace!("** interrupt IDLE");
+                // disable idle line detection
+                r.cr1().modify(|w| {
+                    w.set_idleie(false);
+                });
+
+                s.endrx_waker.wake();
+            }
         }
+
+        trace!("** on_interrupt DONE");
     }
 
-    pub fn split(self) -> (Uart2Rx<'d, T, RxDma>, Uart2Tx<'d, T, TxDma>) {
+    pub fn split(self) -> (UartRxWithIdle<'d, T, RxDma>, UartTx<'d, T, TxDma>) {
         (self.rx, self.tx)
+    }
+
+    pub async fn read_until_idle(&mut self, buffer: &mut [u8]) -> Result<usize, Error>
+    where
+        RxDma: crate::usart::RxDma<T>,
+    {
+        self.rx.read_until_idle(buffer).await
+    }
+}
+
+impl<'d, T: BasicInstance, RxDma> UartRxWithIdle<'d, T, RxDma> {
+    pub async fn read(&mut self, buffer: &mut [u8]) -> Result<(), Error>
+    where
+        RxDma: crate::usart::RxDma<T>,
+    {
+        let r = T::regs();
+        unsafe {
+            r.cr1().modify(|w| {
+                //w.set_rxneie(false);
+                w.set_idleie(false);
+            });
+        }
+
+        compiler_fence(Ordering::SeqCst);
+
+        self.rx.read(buffer).await
+    }
+
+    pub fn nb_read(&mut self) -> Result<u8, nb::Error<Error>> {
+        let r = T::regs();
+        unsafe {
+            r.cr1().modify(|w| {
+                //w.set_rxneie(false);
+                w.set_idleie(false);
+            });
+        }
+
+        compiler_fence(Ordering::SeqCst);
+
+        self.rx.nb_read()
+    }
+
+    pub fn blocking_read(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
+        let r = T::regs();
+        unsafe {
+            r.cr1().modify(|w| {
+                //w.set_rxneie(false);
+                w.set_idleie(false);
+            });
+        }
+
+        compiler_fence(Ordering::SeqCst);
+
+        self.rx.blocking_read(buffer)
+    }
+
+    pub async fn read_until_idle(&mut self, buffer: &mut [u8]) -> Result<usize, Error>
+    where
+        RxDma: crate::usart::RxDma<T>,
+    {
+        trace!("------------------------------------------");
+        // TODO(gmichel): we could return an Error::BufferTooLarge
+        assert!(buffer.len() > 0 && buffer.len() <= 0xFFFF);
+
+        let r = T::regs();
+        unsafe {
+            r.cr1().modify(|w| {
+                w.set_idleie(true);
+            });
+        }
+
+        compiler_fence(Ordering::SeqCst);
+
+        let buffer_len = buffer.len();
+
+        let ch = &mut self.rx.rx_dma;
+        let request = ch.request();
+        unsafe {
+            r.cr3().modify(|reg| {
+                reg.set_dmar(true);
+            });
+        }
+
+        unsafe { ch.start_read(request, rdr(T::regs()), buffer, Default::default()) };
+
+        // // If we don't assign future to a variable, the data register pointer
+        // // is held across an await and makes the future non-Send.
+        // let mut transfer = crate::dma::read(ch, request, rdr(T::regs()), buffer);
+
+        let res = poll_fn(move |cx| {
+            let s = T::state();
+
+            let usart_sr = regs::Sr(s.sr.swap(0, Ordering::SeqCst));
+            trace!("poll_fn sr: {:b}", usart_sr.0);
+
+            if usart_sr.rxne() {
+                trace!("RXNE set");
+                if usart_sr.pe() {
+                    // stop dma transfer
+                    trace!("Stop DMA Parity");
+                    ch.request_stop();
+                    while ch.is_running() {}
+
+                    return Poll::Ready(Err(Error::Parity));
+                }
+                if usart_sr.fe() {
+                    // stop dma transfer
+                    trace!("Stop DMA Framing");
+                    ch.request_stop();
+                    while ch.is_running() {}
+
+                    return Poll::Ready(Err(Error::Framing));
+                }
+                if usart_sr.ne() {
+                    // stop dma transfer
+                    trace!("Stop DMA Noise");
+                    ch.request_stop();
+                    while ch.is_running() {}
+
+                    return Poll::Ready(Err(Error::Noise));
+                }
+                if usart_sr.ore() {
+                    // stop dma transfer
+                    trace!("Stop DMA Overrun");
+                    ch.request_stop();
+                    while ch.is_running() {}
+
+                    return Poll::Ready(Err(Error::Overrun));
+                }
+            }
+
+            if usart_sr.idle() {
+                trace!("IDLE set");
+
+                // // because IDLE happens before DMA complete,
+                // // we may still have 1 byte in DR
+                // // so we wait for DMA to copy this byte
+                // unsafe { while sr(r).read().rxne() {} }
+
+                // stop dma transfer
+                trace!("Stop DMA");
+                ch.request_stop();
+                while ch.is_running() {}
+
+                let n = buffer_len - (ch.remaining_transfers() as usize);
+
+                return Poll::Ready(Ok(n));
+            } else if !ch.is_running() {
+                trace!("DMA Completed");
+                return Poll::Ready(Ok(buffer_len));
+            }
+
+            trace!("Pending");
+            ch.set_waker(cx.waker());
+            s.endrx_waker.register(cx.waker());
+
+            Poll::Pending
+        })
+        .await;
+
+        unsafe {
+            r.cr1().modify(|w| {
+                w.set_idleie(false);
+            });
+        }
+
+        compiler_fence(Ordering::SeqCst);
+
+        res
+    }
+}
+
+impl<'a, T: BasicInstance, RxDma> Drop for UartRxWithIdle<'a, T, RxDma> {
+    fn drop(&mut self) {
+        trace!("uarte rx drop");
+
+        let r = T::regs();
+
+        // TODO(gmichel): add proper drop actions
+
+        let s = T::state();
+
+        drop_tx_rx(&r, &s);
+    }
+}
+
+pub(crate) fn drop_tx_rx(_r: &crate::pac::usart::Usart, s: &sealed::State) {
+    if s.tx_rx_refcount.fetch_sub(1, Ordering::Relaxed) == 1 {
+        // Finally we can disable, and we do so for the peripheral
+        // i.e. not just rx concerns.
+        // TODO(gmichel): implement drop
+
+        trace!("uarte tx and rx drop: done");
     }
 }
 
@@ -645,22 +844,26 @@ unsafe fn clear_interrupt_flags(r: Regs, sr: regs::Isr) {
 pub(crate) mod sealed {
     use core::sync::atomic::AtomicU8;
 
+    use atomic_polyfill::AtomicU32;
     use embassy_sync::waitqueue::AtomicWaker;
 
     use super::*;
 
     pub struct State {
         pub endrx_waker: AtomicWaker,
-        pub endtx_waker: AtomicWaker,
+        // pub endtx_waker: AtomicWaker,
         pub tx_rx_refcount: AtomicU8,
+        // status register in previous interrupt before clear
+        pub sr: AtomicU32,
     }
 
     impl State {
         pub const fn new() -> Self {
             Self {
                 endrx_waker: AtomicWaker::new(),
-                endtx_waker: AtomicWaker::new(),
+                // endtx_waker: AtomicWaker::new(),
                 tx_rx_refcount: AtomicU8::new(0),
+                sr: AtomicU32::new(0),
             }
         }
     }
