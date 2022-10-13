@@ -343,18 +343,29 @@ impl<'d, T: BasicInstance, TxDma, RxDma> UartWithIdle<'d, T, TxDma, RxDma> {
             tx.set_as_af(tx.af_num(), AFType::OutputPushPull);
 
             r.cr2().write(|_w| {});
-            r.cr3().write(|_w| {});
+            r.cr3().write(|w| {
+                // enable Error Interrupt: (Frame error, Noise error, Overrun error)
+                w.set_eie(true);
+            });
             r.brr().write_value(regs::Brr(div));
             r.cr1().write(|w| {
+                // enable uart
                 w.set_ue(true);
+                // enable transmitter
                 w.set_te(true);
+                // enable receiver
                 w.set_re(true);
+                // configure word size
                 w.set_m0(if config.parity != Parity::ParityNone {
                     vals::M0::BIT9
                 } else {
                     vals::M0::BIT8
                 });
-                w.set_pce(config.parity != Parity::ParityNone);
+                // configure parity and enable interrupt if any
+                if config.parity != Parity::ParityNone {
+                    w.set_pce(true);
+                    w.set_peie(true);
+                }
                 w.set_ps(match config.parity {
                     Parity::ParityOdd => vals::Ps::ODD,
                     Parity::ParityEven => vals::Ps::EVEN,
@@ -384,31 +395,53 @@ impl<'d, T: BasicInstance, TxDma, RxDma> UartWithIdle<'d, T, TxDma, RxDma> {
         let r = T::regs();
         let s = T::state();
 
-        // TODO(gmichel): implement interrupt handler correctly
-        unsafe {
-            let sr = sr(r).read();
+        let (sr, cr1, cr3) = unsafe { (sr(r).read(), r.cr1().read(), r.cr3().read()) };
 
-            // This read also clears the error and idle interrupt flags on v1.
-            let _ = rdr(r).read_volatile();
+        trace!("** on_interrupt called. sr: {:b}", sr.0);
+        trace!("** on_interrupt called. cr1: {:b}", cr1.0);
+        trace!("** on_interrupt called. cr3: {:b}", cr3.0);
 
-            clear_interrupt_flags(r, sr);
+        let has_errors = (sr.pe() && cr1.peie()) || ((sr.fe() || sr.ne() || sr.ore()) && cr3.eie());
 
-            trace!("** on_interrupt called. sr: {:b}", sr.0);
-
-            s.sr.store(sr.0, Ordering::SeqCst);
-
-            if sr.idle() {
-                trace!("** interrupt IDLE");
-                // disable idle line detection
+        if has_errors {
+            // clear all interrupts and DMA Rx Request
+            unsafe {
                 r.cr1().modify(|w| {
+                    // disable RXNE interrupt
+                    w.set_rxneie(false);
+                    // disable parity interrupt
+                    w.set_peie(false);
+                    // disable idle line interrupt
+                    w.set_idleie(false);
+                });
+                r.cr3().modify(|w| {
+                    // disable Error Interrupt: (Frame error, Noise error, Overrun error)
+                    w.set_eie(false);
+                    // disable DMA Rx Request
+                    w.set_dmar(false);
+                });
+            }
+
+            compiler_fence(Ordering::SeqCst);
+
+            s.endrx_waker.wake();
+        } else if cr1.idleie() && sr.idle() {
+            // IDLE detected: no more data will come
+            unsafe {
+                r.cr1().modify(|w| {
+                    // disable idle line detection
                     w.set_idleie(false);
                 });
 
-                s.endrx_waker.wake();
+                r.cr3().modify(|w| {
+                    // disable DMA Rx Request
+                    w.set_dmar(false);
+                });
             }
-        }
+            compiler_fence(Ordering::SeqCst);
 
-        trace!("** on_interrupt DONE");
+            s.endrx_waker.wake();
+        }
     }
 
     pub fn split(self) -> (UartRxWithIdle<'d, T, RxDma>, UartTx<'d, T, TxDma>) {
@@ -473,12 +506,92 @@ impl<'d, T: BasicInstance, RxDma> UartRxWithIdle<'d, T, RxDma> {
     where
         RxDma: crate::usart::RxDma<T>,
     {
+        // TODO : use modify instead of write for registers
         trace!("------------------------------------------");
         // TODO(gmichel): we could return an Error::BufferTooLarge
         assert!(buffer.len() > 0 && buffer.len() <= 0xFFFF);
 
         let r = T::regs();
+
+        let buffer_len = buffer.len();
+
+        let ch = &mut self.rx.rx_dma;
+        let request = ch.request();
+
         unsafe {
+            // Start USART DMA
+            // will not do anything yet because DMAR is not yet set
+            ch.start_read(request, rdr(r), buffer, Default::default());
+
+            // clear ORE flag just before enabling DMA Rx Request: can be mandatory for the second transfer
+            {
+                let sr = sr(r).read();
+                // This read also clears the error and idle interrupt flags on v1.
+                let _ = rdr(r).read_volatile();
+                clear_interrupt_flags(r, sr);
+            }
+
+            r.cr1().modify(|w| {
+                // disable RXNE interrupt
+                w.set_rxneie(false);
+                // enable parity interrupt if not ParityNone
+                w.set_peie(w.pce());
+            });
+
+            r.cr3().modify(|w| {
+                // enable Error Interrupt: (Frame error, Noise error, Overrun error)
+                w.set_eie(true);
+                // enable DMA Rx Request
+                w.set_dmar(true);
+            });
+
+            compiler_fence(Ordering::SeqCst);
+
+            // In case of errors already pending when reception started, interrupts may have already been raised
+            // and lead to reception abortion (Overrun error for instance). In such a case, all interrupts
+            // have been disabled in interrupt handler and DMA Rx Request has been disabled.
+
+            let cr3 = r.cr3().read();
+
+            if !cr3.dmar() {
+                // something went wrong
+
+                // abort DMA transfer
+                ch.request_stop();
+                while ch.is_running() {}
+
+                return poll_fn(move |_cx| {
+                    let sr = sr(r).read();
+                    // This read also clears the error and idle interrupt flags on v1.
+                    let _ = rdr(r).read_volatile();
+                    clear_interrupt_flags(r, sr);
+
+                    if sr.pe() {
+                        return Poll::Ready(Err(Error::Parity));
+                    }
+                    if sr.fe() {
+                        return Poll::Ready(Err(Error::Framing));
+                    }
+                    if sr.ne() {
+                        return Poll::Ready(Err(Error::Noise));
+                    }
+                    if sr.ore() {
+                        return Poll::Ready(Err(Error::Overrun));
+                    }
+
+                    unreachable!();
+                })
+                .await;
+            }
+
+            // clear idle flag
+            {
+                let sr = sr(r).read();
+                // This read also clears the error and idle interrupt flags on v1.
+                let _ = rdr(r).read_volatile();
+                clear_interrupt_flags(r, sr);
+            }
+            // enable idle interrupt
             r.cr1().modify(|w| {
                 w.set_idleie(true);
             });
@@ -486,71 +599,67 @@ impl<'d, T: BasicInstance, RxDma> UartRxWithIdle<'d, T, RxDma> {
 
         compiler_fence(Ordering::SeqCst);
 
-        let buffer_len = buffer.len();
-
-        let ch = &mut self.rx.rx_dma;
-        let request = ch.request();
-        unsafe {
-            r.cr3().modify(|reg| {
-                reg.set_dmar(true);
-            });
-        }
-
-        unsafe { ch.start_read(request, rdr(T::regs()), buffer, Default::default()) };
-
-        // // If we don't assign future to a variable, the data register pointer
-        // // is held across an await and makes the future non-Send.
-        // let mut transfer = crate::dma::read(ch, request, rdr(T::regs()), buffer);
-
         let res = poll_fn(move |cx| {
+            // ch.set_waker(cx.waker());
+
             let s = T::state();
 
-            let usart_sr = regs::Sr(s.sr.swap(0, Ordering::SeqCst));
+            let usart_sr = unsafe { sr(r).read() };
+
+            unsafe {
+                // This read also clears the error and idle interrupt flags on v1.
+                let _ = rdr(r).read_volatile();
+
+                clear_interrupt_flags(r, usart_sr);
+            }
+
+            compiler_fence(Ordering::SeqCst);
+
             trace!("poll_fn sr: {:b}", usart_sr.0);
 
-            if usart_sr.rxne() {
-                trace!("RXNE set");
-                if usart_sr.pe() {
-                    // stop dma transfer
-                    trace!("Stop DMA Parity");
-                    ch.request_stop();
-                    while ch.is_running() {}
+            let has_errors = usart_sr.pe() || usart_sr.fe() || usart_sr.ne() || usart_sr.ore();
 
+            if has_errors {
+                // clear all interrupts and DMA Rx Request
+                unsafe {
+                    r.cr1().modify(|w| {
+                        // disable RXNE interrupt
+                        w.set_rxneie(false);
+                        // disable parity interrupt
+                        w.set_peie(false);
+                        // disable idle line interrupt
+                        w.set_idleie(false);
+                    });
+                    r.cr3().modify(|w| {
+                        // disable Error Interrupt: (Frame error, Noise error, Overrun error)
+                        w.set_eie(false);
+                        // disable DMA Rx Request
+                        w.set_dmar(false);
+                    });
+                }
+
+                compiler_fence(Ordering::SeqCst);
+
+                // stop dma transfer
+                ch.request_stop();
+                while ch.is_running() {}
+
+                if usart_sr.pe() {
                     return Poll::Ready(Err(Error::Parity));
                 }
                 if usart_sr.fe() {
-                    // stop dma transfer
-                    trace!("Stop DMA Framing");
-                    ch.request_stop();
-                    while ch.is_running() {}
-
                     return Poll::Ready(Err(Error::Framing));
                 }
                 if usart_sr.ne() {
-                    // stop dma transfer
-                    trace!("Stop DMA Noise");
-                    ch.request_stop();
-                    while ch.is_running() {}
-
                     return Poll::Ready(Err(Error::Noise));
                 }
                 if usart_sr.ore() {
-                    // stop dma transfer
-                    trace!("Stop DMA Overrun");
-                    ch.request_stop();
-                    while ch.is_running() {}
-
                     return Poll::Ready(Err(Error::Overrun));
                 }
             }
 
             if usart_sr.idle() {
                 trace!("IDLE set");
-
-                // // because IDLE happens before DMA complete,
-                // // we may still have 1 byte in DR
-                // // so we wait for DMA to copy this byte
-                // unsafe { while sr(r).read().rxne() {} }
 
                 // stop dma transfer
                 trace!("Stop DMA");
@@ -573,13 +682,23 @@ impl<'d, T: BasicInstance, RxDma> UartRxWithIdle<'d, T, RxDma> {
         })
         .await;
 
+        // clear all interrupts and DMA Rx Request
         unsafe {
             r.cr1().modify(|w| {
+                // disable RXNE interrupt
+                w.set_rxneie(false);
+                // disable parity interrupt
+                w.set_peie(false);
+                // disable idle line interrupt
                 w.set_idleie(false);
             });
+            r.cr3().modify(|w| {
+                // disable Error Interrupt: (Frame error, Noise error, Overrun error)
+                w.set_eie(false);
+                // disable DMA Rx Request
+                w.set_dmar(false);
+            });
         }
-
-        compiler_fence(Ordering::SeqCst);
 
         res
     }
@@ -844,7 +963,6 @@ unsafe fn clear_interrupt_flags(r: Regs, sr: regs::Isr) {
 pub(crate) mod sealed {
     use core::sync::atomic::AtomicU8;
 
-    use atomic_polyfill::AtomicU32;
     use embassy_sync::waitqueue::AtomicWaker;
 
     use super::*;
@@ -853,8 +971,6 @@ pub(crate) mod sealed {
         pub endrx_waker: AtomicWaker,
         // pub endtx_waker: AtomicWaker,
         pub tx_rx_refcount: AtomicU8,
-        // status register in previous interrupt before clear
-        pub sr: AtomicU32,
     }
 
     impl State {
@@ -863,7 +979,6 @@ pub(crate) mod sealed {
                 endrx_waker: AtomicWaker::new(),
                 // endtx_waker: AtomicWaker::new(),
                 tx_rx_refcount: AtomicU8::new(0),
-                sr: AtomicU32::new(0),
             }
         }
     }
