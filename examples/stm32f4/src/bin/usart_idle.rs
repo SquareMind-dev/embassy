@@ -12,9 +12,9 @@ use embassy_stm32::usart::{Config, Uart, UartWithIdle};
 use embassy_time::{Duration, Timer};
 use {defmt_rtt as _, panic_probe as _};
 
-const INCOMMING_DATA_SIZE: usize = 10;
-const BUFFER_SIZE: usize = 8;
-const MAIN_BUFFER_SIZE: usize = 16;
+const INCOMMING_DATA_SIZE: usize = 17;
+const BUFFER_SIZE: usize = 16;
+const MAIN_BUFFER_SIZE: usize = 32;
 const FIRST_VALUE: u8 = 0;
 
 pub fn config() -> embassy_stm32::Config {
@@ -47,7 +47,7 @@ async fn emitter_task(mut uart: Uart<'static, USART1, DMA2_CH7, NoDma>) {
     fill_ref_buffer(&mut buffer);
 
     loop {
-        Timer::after(Duration::from_secs(1)).await;
+        Timer::after(Duration::from_millis(500)).await;
 
         defmt::info!("Starting emitting data...");
 
@@ -61,10 +61,21 @@ async fn main(spawner: Spawner) -> ! {
     info!("Hello World!");
 
     let mut config = Config::default();
-    config.baudrate = 9600;
+    config.baudrate = 115200;
+
+    let detect_previous_overrun = true;
 
     let irq = interrupt::take!(USART3);
-    let mut usart = UartWithIdle::new(p.USART3, irq, p.PC5, p.PB10, NoDma, p.DMA1_CH1, config);
+    let mut usart = UartWithIdle::new(
+        p.USART3,
+        irq,
+        p.PC5,
+        p.PB10,
+        NoDma,
+        p.DMA1_CH1,
+        config,
+        detect_previous_overrun,
+    );
 
     let emitter = Uart::new(p.USART1, p.PA10, p.PA9, p.DMA2_CH7, NoDma, config);
 
@@ -73,7 +84,6 @@ async fn main(spawner: Spawner) -> ! {
     let mut main_buffer: [u8; MAIN_BUFFER_SIZE] = [0; MAIN_BUFFER_SIZE];
 
     defmt::assert!(BUFFER_SIZE <= MAIN_BUFFER_SIZE);
-    defmt::assert!(INCOMMING_DATA_SIZE <= MAIN_BUFFER_SIZE);
 
     spawner.spawn(emitter_task(emitter)).unwrap();
 
@@ -81,44 +91,37 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut new_pos = 0;
 
-    // abcdefghijklmno
-    // abcdefghijklmnopqrs
-    // 12345678
-    // 1234567
-    // 123456
-    // 12345
-    // 1234
-    // 123
-    // 12
     loop {
         let received_bytes = usart.read_until_idle(&mut buffer).await.unwrap();
 
-        info!("Received {} bytes: {}", received_bytes, buffer[..received_bytes]);
+        // info!("Received {} bytes: {}", received_bytes, buffer[..received_bytes]);
 
         if received_bytes > 0 {
             if buffer[0] != first_value || buffer[received_bytes - 1] != first_value + (received_bytes - 1) as u8 {
-                defmt::error!("missing data: received {}", buffer[..received_bytes]);
+                defmt::panic!("missing data: received {}", buffer[..received_bytes]);
             }
         } else {
-            defmt::warn!("Received 0 bytes");
+            defmt::panic!("Received 0 bytes");
         }
 
         first_value += received_bytes as u8;
 
         first_value %= INCOMMING_DATA_SIZE as u8;
 
-        // // copy data to larger main ring buffer
-        // let old_pos = new_pos;
-        // if old_pos + received_bytes > MAIN_BUFFER_SIZE {
-        //     let data_to_copy = MAIN_BUFFER_SIZE - old_pos;
-        //     main_buffer[old_pos..].copy_from_slice(&buffer[..data_to_copy]);
-        //     new_pos = received_bytes - data_to_copy;
-        //     main_buffer[..new_pos].copy_from_slice(&buffer[data_to_copy..received_bytes]);
-        // } else {
-        //     new_pos = old_pos + received_bytes;
-        //     main_buffer[old_pos..new_pos].copy_from_slice(&buffer[..received_bytes]);
-        // }
+        // copy data to larger main ring buffer
+        let old_pos = new_pos;
+        if old_pos + received_bytes > MAIN_BUFFER_SIZE {
+            let data_to_copy = MAIN_BUFFER_SIZE - old_pos;
+            main_buffer[old_pos..].copy_from_slice(&buffer[..data_to_copy]);
+            new_pos = received_bytes - data_to_copy;
+            main_buffer[..new_pos].copy_from_slice(&buffer[data_to_copy..received_bytes]);
+        } else {
+            new_pos = old_pos + received_bytes;
+            main_buffer[old_pos..new_pos].copy_from_slice(&buffer[..received_bytes]);
+        }
 
         // info!("Main buffer: {}", main_buffer);
+
+        //Timer::after(Duration::from_millis(1200)).await;
     }
 }
