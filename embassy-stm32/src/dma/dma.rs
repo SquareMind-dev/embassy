@@ -404,11 +404,18 @@ mod low_level_api {
         let cr = dma.st(channel_num).cr();
         let isr = dma.isr(channel_num / 4).read();
 
+        defmt::trace!(
+            "++ DMA interrupt handler called - isr: {:b} - cr: {:b}",
+            isr.0,
+            cr.read().0
+        );
+
         if isr.teif(channel_num % 4) {
             panic!("DMA: error on DMA@{:08x} channel {}", dma.0 as u32, channel_num);
         }
 
         if isr.tcif(channel_num % 4) && cr.read().tcie() {
+            defmt::trace!("++ DMA TC");
             if cr.read().dbm() == vals::Dbm::DISABLED {
                 cr.write(|_| ()); // Disable channel with the default value.
             } else {
