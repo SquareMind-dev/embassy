@@ -1,6 +1,7 @@
 use core::sync::atomic::{fence, Ordering};
 use core::task::Waker;
 
+use embassy_cortex_m::interrupt::Handler;
 use embassy_sync::waitqueue::AtomicWaker;
 
 use super::{Burst, FlowControl, Request, TransferOptions, Word, WordSize};
@@ -41,12 +42,14 @@ impl From<FlowControl> for vals::Pfctrl {
 
 struct ChannelState {
     waker: AtomicWaker,
+    handler: Handler,
 }
 
 impl ChannelState {
     const fn new() -> Self {
         Self {
             waker: AtomicWaker::new(),
+            handler: Handler::new(),
         }
     }
 }
@@ -58,6 +61,7 @@ struct State {
 impl State {
     const fn new() -> Self {
         const CH: ChannelState = ChannelState::new();
+
         Self {
             channels: [CH; DMA_CHANNEL_COUNT],
         }
@@ -199,6 +203,18 @@ foreach_dma_channel! {
                 unsafe {
                     low_level_api::on_irq_inner(pac::$dma_peri, $channel_num, $index);
                 }
+            }
+
+            fn set_handler(&self, func: unsafe fn(*mut ())) {
+                low_level_api::set_handler($index, func);
+            }
+
+            fn remove_handler(&self) {
+                low_level_api::remove_handler($index);
+            }
+
+            fn set_handler_context(&self, ctx: *mut ()) {
+                low_level_api::set_handler_context($index, ctx);
             }
         }
         impl crate::dma::Channel for crate::peripherals::$channel_peri { }
@@ -404,6 +420,18 @@ mod low_level_api {
         let cr = dma.st(channel_num).cr();
         let isr = dma.isr(channel_num / 4).read();
 
+        let func = &STATE.channels[state_index].handler.func;
+
+        let func_ptr = func.load(Ordering::SeqCst);
+
+        if func_ptr == core::ptr::null_mut() {
+            defmt::error!("++ No DMA handler set");
+        } else {
+            let f: fn(*mut ()) = unsafe { core::mem::transmute(func_ptr) };
+
+            f(core::ptr::null_mut());
+        }
+
         defmt::trace!(
             "++ DMA interrupt handler called - isr: {:b} - cr: {:b}",
             isr.0,
@@ -424,5 +452,31 @@ mod low_level_api {
             }
             STATE.channels[state_index].waker.wake();
         }
+    }
+
+    pub fn set_handler(state_index: u8, func: unsafe fn(*mut ())) {
+        let state_index = state_index as usize;
+
+        fence(Ordering::SeqCst);
+        let handler = &STATE.channels[state_index].handler;
+
+        handler.func.store(func as *mut (), Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+    }
+
+    pub fn remove_handler(state_index: u8) {
+        let state_index = state_index as usize;
+
+        fence(Ordering::SeqCst);
+        let handler = &STATE.channels[state_index].handler;
+        handler.func.store(core::ptr::null_mut(), Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+    }
+
+    pub fn set_handler_context(state_index: u8, ctx: *mut ()) {
+        let state_index = state_index as usize;
+
+        let handler = &STATE.channels[state_index].handler;
+        handler.ctx.store(ctx, Ordering::Relaxed);
     }
 }

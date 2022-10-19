@@ -77,6 +77,14 @@ where
         Self { _peri: peri, rx_dma }
     }
 
+    fn on_interrupt_dma(_: *mut ()) {
+        defmt::error!("== on_interrupt_dma called");
+    }
+
+    // fn on_interrupt_dma(&mut self) {
+    //     defmt::error!("== on_interrupt_dma called");
+    // }
+
     fn on_interrupt(_: *mut ()) {
         defmt::trace!("** on_interrupt called!");
 
@@ -124,6 +132,19 @@ where
 
         let ch = &mut self.rx_dma;
         let request = ch.request();
+
+        ch.set_handler(Self::on_interrupt_dma);
+
+        // ch.set_handler(|p| unsafe {
+        //     let me = &mut *(p as *mut Self);
+        //     me.on_interrupt_dma();
+        // });
+
+        // let me_ptr: *mut Self = self as *mut Self;
+
+        // let me_ptr: *mut Self = unsafe { core::mem::transmute(&self) };
+
+        // ch.set_handler_context(me_ptr as *mut ());
 
         unsafe {
             ch.start_double_buffered_read(

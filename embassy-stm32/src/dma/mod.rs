@@ -116,6 +116,26 @@ pub(crate) mod sealed {
         /// Note: Because some channels share an interrupt, this function might be
         /// called for a channel that didn't trigger an interrupt.
         fn on_irq();
+
+        /// Configure the interrupt handler for this interrupt.
+        ///
+        /// # Safety
+        ///
+        /// It is the responsibility of the caller to ensure the handler
+        /// points to a valid handler as long as interrupts are enabled.
+        fn set_handler(&self, func: unsafe fn(*mut ())) {}
+
+        /// Remove the interrupt handler for this interrupt.
+        fn remove_handler(&self) {}
+
+        /// Set point to a context that is passed to the interrupt handler when
+        /// an interrupt is pending.
+        ///
+        /// # Safety
+        ///
+        /// It is the responsibility of the caller to ensure the context
+        /// points to a valid handler as long as interrupts are enabled.
+        fn set_handler_context(&self, ctx: *mut ()) {}
     }
 }
 
