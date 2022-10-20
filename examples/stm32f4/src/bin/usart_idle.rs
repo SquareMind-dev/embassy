@@ -17,6 +17,7 @@ use {defmt_rtt as _, panic_probe as _};
 const INCOMMING_DATA_SIZE: usize = 17;
 const BUFFER_SIZE: usize = 16;
 const MAIN_BUFFER_SIZE: usize = 32;
+const FIRST_VALUE: u8 = 0;
 
 pub fn config() -> embassy_stm32::Config {
     let mut config = embassy_stm32::Config::default();
@@ -33,7 +34,7 @@ pub fn config() -> embassy_stm32::Config {
 }
 
 fn fill_ref_buffer(buffer: &mut [u8]) {
-    let mut ch = 0;
+    let mut ch = FIRST_VALUE;
 
     for i in 0..buffer.len() {
         buffer[i] = ch;
@@ -48,7 +49,7 @@ async fn emitter_task(mut uart: Uart<'static, USART1, DMA2_CH7, NoDma>) {
     fill_ref_buffer(&mut buffer);
 
     loop {
-        Timer::after(Duration::from_millis(500)).await;
+        Timer::after(Duration::from_millis(100)).await;
 
         uart.write(&buffer).await.unwrap();
     }
@@ -65,7 +66,7 @@ async fn main(spawner: Spawner) -> ! {
     config.detect_previous_overrun = true;
 
     let irq_uart3 = interrupt::take!(USART3);
-    let mut usart = Uart::new(p.USART3, p.PB11, p.PB10, irq_uart3, NoDma, p.DMA1_CH1, config);
+    let mut usart = Uart::new(p.USART3, p.PC5, p.PB10, irq_uart3, NoDma, p.DMA1_CH1, config);
 
     // you could also use only Rx with Idle line detection
     // it saves 1 pin
@@ -85,12 +86,29 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.spawn(emitter_task(emitter)).unwrap();
 
+    let mut first_value = FIRST_VALUE;
+
     let mut new_pos = 0;
 
     loop {
+        // usart.read(&mut buffer).await.unwrap();
+        // info!("Received data: {}", buffer);
+
         let received_bytes = usart.read_until_idle(&mut buffer).await.unwrap();
 
         info!("Received {} bytes: {}", received_bytes, buffer[..received_bytes]);
+
+        if received_bytes > 0 {
+            if buffer[0] != first_value || buffer[received_bytes - 1] != first_value + (received_bytes - 1) as u8 {
+                defmt::panic!("missing data: received {}", buffer[..received_bytes]);
+            }
+        } else {
+            defmt::panic!("Received 0 bytes");
+        }
+
+        first_value += received_bytes as u8;
+
+        first_value %= INCOMMING_DATA_SIZE as u8;
 
         // copy data to larger main ring buffer
         let old_pos = new_pos;
@@ -104,6 +122,7 @@ async fn main(spawner: Spawner) -> ! {
             main_buffer[old_pos..new_pos].copy_from_slice(&buffer[..received_bytes]);
         }
 
-        info!("Main buffer: {}", main_buffer);
+        //info!("Main buffer: {}", main_buffer);
+        //Timer::after(Duration::from_millis(450)).await;
     }
 }
